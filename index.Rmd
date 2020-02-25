@@ -1,30 +1,255 @@
 ---
-title: "Prediction Assignment"
+title: "Predicting exercise quality using sensor data"
 author: "Arshad Nair"
 date: "2/25/2020"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+```{r global.options, include = TRUE, results = "hide", message=FALSE, warning=FALSE, echo=FALSE}
+
+# GLOBAL knitr OPTIONS
+knitr::opts_chunk$set(fig.width=6,fig.height=4, fig.align='center',
+                      warning=FALSE,echo=FALSE,
+                      cache.extra = list(R.version, sessionInfo(), format(Sys.Date(), '%Y-%m')))
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r results = "hide", message=FALSE, warning=FALSE, echo=FALSE}
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", 
+         paste0("\n \\", options$size,"\n\n", 
+                x, "\n\n \\normalsize"), x)})
 ```
 
-## Including Plots
+## Synopsis
 
-You can also embed plots, for example:
+In this assignment, we examine how well a unilateral biceps 
+dumbbell curl is performed based on activity sensor measurements.
+A random forest model (RFM) is trained on the 
+publicly available [Weight Lifting Exercise Dataset][1]. The model is 
+evaluated and then used to predict for 20 cases, what quality of
+exercise was performed. The developed RFM has an accuracy > 99% 
+(lower bound of 95% confidence interval) and was able to correctly classify
+all test cases (evaluated from the score on the quiz.)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+[1]: http://groupware.les.inf.puc-rio.br/har
+
+## Data Processing
+
+> Load Libraries
+
+```{r loadlibs, results = "hide", message=FALSE, warning=FALSE}
+
+# LOAD NECESSARY LIBRARIES
+list.of.packages <- c("knitr", "htmlTable", "data.table", "dplyr", "ggplot2", "ggpubr", "summarytools", "ranger", "caret")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+> Data download
+
+```{r datadown, results = "hide"}
+
+# DATA DOWNLOAD
+temptrain <- tempfile()
+temptests <- tempfile()
+download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile = temptrain, mode='wb')
+download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile = temptests, mode='wb')
+
+```
+
+> Data load
+
+The data in this exercise comes from the publicly available [Weight Lifting Exercise Dataset][1].
+"Participants were asked to perform one set of 10 repetitions
+of the Unilateral Dumbbell Biceps Curl in five different fashions: 
+exactly according to the specification (Class A), throwing the 
+elbows to the front (Class B), lifting the dumbbell
+only halfway (Class C), lowering the dumbbell only halfway
+(Class D) and throwing the hips to the front (Class E). Class
+A corresponds to the specified execution of the exercise,
+while the other 4 classes correspond to common mistakes.": [Velloso et al. (2013)][2]
+
+[2]: https://doi.org/10.1145/2459236.2459256
+
+```{r dataload}
+
+# DATA READ-IN
+train_read <- read.csv(temptrain)
+unlink(temptrain)
+tests_read <- read.csv(temptests)
+unlink(temptests)
+
+```
+
+> Exploratory data analysis and data cleaning
+
+Once the data is loaded in, we do some exploratory data analysis.
+There are `r nrow(train_read)` observations of `r ncol(train_read)` parameters in the training data; 
+and `r nrow(tests_read)` observations of `r ncol(tests_read)` parameters in the testing data.
+We examine the parameters and their unique elements' count in each data set.
+
+```{r}
+
+# EXAMINING UNIQUE ELEMENTS IN THE DATASETS
+datinit <- data.frame(Train = sapply(sapply(train_read,unique),length), Tests = sapply(sapply(tests_read,unique),length))
+```
+Ignoring the first 7 columns for `r names(train_read[1:7])`, which are not 
+sensor data, the table below shows the count of unique values for each parameter.
+
+```{r echo = FALSE}
+
+datinit <- setDT(datinit, keep.rownames = TRUE)[]
+ddt <- cbind(datinit[8:45, ], datinit[46:83, ], datinit[122:159, ], datinit[84:121, ])
+
+htmlTable(ddt, cgroup = c("Belt", "Arm", "Forearm", "Dumbbell"),
+          n.cgroup = c(3, 3, 3, 3), rnames = F,
+          css.cell = "padding-left: .5em; padding-right: .2em;",
+          caption="Table: All sensor measurements.")
+
+```
+
+Due to the large number of parameters and largely to avoid introducing any feature
+selection bias, we do not engage in examining the exercise class-wise differences
+in other parameters. We remove the single unique-value parameters (columns with NAs) 
+for a more robust analysis.
+```{r}
+# REMOVE ANY COLUMNS CONTAINING NA
+train <- train_read[ , colSums(is.na(train_read)) == 0]
+tests <- tests_read[ , colSums(is.na(tests_read)) == 0]
+```
+
+> Pre-processing: PCA
+
+```{r}
+# PCA TO FIND VARIABLES THAT EXPLAIN MOST (95%) OF THE VARIANCE
+trainpca <- preProcess(select(train[8:ncol(train)], - classe), method = c("center", "scale", "YeoJohnson", "nzv", "pca"))
+
+# FEATURE SELECTION
+selectvars <- rownames(trainpca$rotation)
+train5 <- subset(train, select = selectvars)
+train5$classe <- train$classe
+tests5 <- subset(tests, select = c("problem_id",selectvars))
+
+# EXAMINING UNIQUE ELEMENTS IN THE DATASETS AFTER ABOVE
+dat5 <- data.frame(Train = sapply(sapply(train5,unique),length), Tests = sapply(sapply(tests5,unique),length))
+```
+
+We conduct principal component analysis to examine which parameters contribute to the PCA components
+required ot explain most of the variance. The data is centered and scaled, [Yeo-Johnson][3] transformed
+with near-zero variance predictor dropped. The features (parameters) that contribute to the PCA are
+selected, and the data (training and testing) is subsetted by this. The count of unique observations 
+of each parameter are listed below.
+
+```{r echo = FALSE}
+
+dat5 <- setDT(dat5, keep.rownames = TRUE)[]
+ddt <- cbind(dat5[1:13, ], dat5[14:26, ], dat5[40:52, ], dat5[27:39, ])
+
+htmlTable(ddt, cgroup = c("Belt", "Arm", "Forearm", "Dumbbell"),
+          n.cgroup = c(3, 3, 3, 3), rnames = F,
+          css.cell = "padding-left: .5em; padding-right: .2em;",
+          caption="Table: Selected parameters for training the reandom forest.")
+
+```
+
+[3]: https://doi.org/10.1093/biomet/87.4.954
+
+## Model building
+
+> Train data: Training (70%) and Validation (30%)
+
+We first split off 30% of the training data for validation based on the exercise class.
+
+```{r predForest, cache = TRUE}
+# CREATE TRAINING AND VALIDATION SETS
+inTrain <- createDataPartition(y=train5$classe, p=0.7, list=FALSE)
+training <- train5[inTrain,]
+validtng <- train5[-inTrain,]
+```
+
+> k-fold cross-validation
+
+We use the random CV sampling with k = 10 -folds. 
+
+```{r}
+
+# k-FOLD GENERATION
+rf_trControl <- trainControl(method = "cv", number = 10)
+
+# HYPERPARAMETRIZATION
+# rf_hyperparam <- expand.grid(mtry = c(2:5), splitrule = c("gini", "extratrees"), min.node.size = c(1, 3, 5))
+```
+
+> Training the model
+
+The ranger function is used to train the random forest model. The following 
+model is finalized across tuning parameters, with mtry = 52, 
+splitrule = extratrees, and min.node.size = 1:
+
+```{r rfmodchunk, cache = TRUE}
+# SEARCHING FOR OPTIMAL RF MODEL
+# rf_mod <- train(as.factor(classe) ~ ., data = training, method = "ranger", trControl = rf_trControl, tuneGrid = rf_hyperparam)
+rfmod <- train(as.factor(classe) ~ ., data = training, method = "ranger", trControl = rf_trControl)
+```
+
+```{r dependson="rfmodchunk"}
+rfmod$finalModel
+```
+
+> Model evaluation
+
+The model is selected and tested on the 30% of the data that was split off for validation.
+```{r rfpredchunk, dependson="rfmodchunk"}
+# TRAINING THE RANDOM FOREST
+# rfmod <- rf_mod$finalModel
+# rfmod <- ranger(as.factor(classe) ~ ., data = training)
+
+# VALIDATING USING THE VALIDATION SUBSET OF THE TRAIN DATA
+pred <- predict(rfmod, validtng[-53])
+```
+
+The confusion matrix for the model based on the validation set:
+```{r}
+# EVALUATING MODEL PERFORMANCE
+confusionMatrix(pred,validtng$classe)
+```
+The model has an accuracy of 99.51% ([99.29%, 99.67%]: 95% confidence interval) and
+$\kappa$ = 0.9938, which indicates extremely good classification ability. Other
+model evaluation metrics are above. While the out-of-bag (OOB) error from the model
+is 0.47%, it is more meaningful to look at the out-of-sample error. Here, it is $1 - accuracy$;
+**the out-of-sample error is $\sim 0.49\%$**.
+
+## Prediction
+
+Confident in the developed random forest model, we predict for the 20 test cases
+the exercise class based on the values for the parameters. The predictions are listed
+below. They are verified through Quiz 4 as being correct.
+
+```{r}
+# PREDICTING EXERCISE CLASS FOR THE TEST DATA
+predv <- predict(rfmod, tests5[-1])
+
+# TABLE OF TEST CASES AND PREDICTED EXERCISE CLASS
+predfintab <- data.frame(ProblemID = tests5$problem_id, Predicted = predv)
+predfintab2 <- cbind(predfintab[1:10, ], predfintab[11:20, ])
+
+htmlTable(predfintab2, rnames = F,
+          css.cell = "padding-left: .5em; padding-right: .2em;",
+          caption="Table: Prediction of exercise class on the 20 test cases.")
+```
+
+## Conclusions
+
+* A random forest model for classification of exercise class from measurements of on-body and on-dumbbell sensors was developed.
+* Principal component analysis and k-fold cross validation helped remove spurious correlations effect and over-fitting, respectively.
+* The random forest model performs with > 99% accuracy in classification of exercise class.
+* The model was deployed to classify 20 test cases' exercise class with 100% accuracy.
+
+### All code used in this report follows:
+
+```{r ref.label = knitr::all_labels(), echo = TRUE, eval = FALSE, size = "scriptsize"}
+
+```
